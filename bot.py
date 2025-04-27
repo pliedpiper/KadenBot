@@ -45,7 +45,7 @@ intents = discord.Intents.default()
 intents.messages = True       # To receive messages
 intents.message_content = True # To read message content (Requires Privileged Intent)
 intents.guilds = True         # To identify the bot user and access guild information
-# *** ADDED: SERVER MEMBERS INTENT IS REQUIRED FOR STATUS LOOKUP ***
+# *** SERVER MEMBERS INTENT IS REQUIRED FOR STATUS LOOKUP ***
 # *** Make sure this is enabled in the Discord Developer Portal too! ***
 intents.members = True
 
@@ -76,7 +76,7 @@ async def on_ready():
     logging.info(f'{discord_client.user.name} (ID: {discord_client.user.id}) is online.')
     print(f'Logged in as {discord_client.user.name}')
     print('------')
-    print("KadenBot is online.")
+    print("KadenBot is online. Ready to be bothered.") # Adjusted startup message
     print('------')
 
 @discord_client.event
@@ -106,42 +106,54 @@ async def on_message(message: discord.Message):
                     question = content.replace(mention_string, '').replace(mention_string_nick, '').strip()
 
                 if not question:
-                    await message.reply("You mentioned me, but didn't ask a question!")
+                    # Sarcastic reply for no question
+                    await message.reply("Wow, you managed to ping me without actually asking anything. Impressive levels of pointless. Try again, maybe with a *real* question this time? Or don't. See if I care.")
                     logging.warning(f"Empty question from {message.author} after stripping mention.")
                     return
 
-                logging.info(f"Received potential question: '{question}'")
+                logging.info(f"Received potential query: '{question}'")
 
-                # *** NEW: Check for "who's online" keywords ***
+                # *** Check for "who's online" keywords FIRST ***
                 question_lower = question.lower()
                 online_keywords = ["who's online", "who is online", "online members", "members online", "list online"]
                 is_online_query = any(keyword in question_lower for keyword in online_keywords)
 
                 if is_online_query:
-                    logging.info(f"Handling 'who's online' request from {message.author}.")
+                    logging.info(f"Handling 'who's online' request from {message.author}. How tedious.")
                     online_users = get_online_members_list(message.guild)
 
                     if not online_users:
-                        reply_text = "It seems no users are currently online (or I couldn't see them)."
+                        reply_text = "Ugh, looks like everyone has better things to do than be online right now. Shocking. Or maybe I just can't be bothered to see them properly."
                     else:
-                        reply_text = "Here are the members currently online:\n- " + "\n- ".join(online_users)
-                        # Optional: Add a count
-                        # reply_text = f"There are {len(online_users)} members currently online:\n- " + "\n- ".join(online_users)
+                        count = len(online_users)
+                        reply_text = f"Fine. Since you asked *so nicely* (you didn't), here are the {count} apparent lifeforms currently online:\n- " + "\n- ".join(online_users)
+                        reply_text += "\nNow leave me alone."
 
                     # Truncate if somehow the list is massive (unlikely for usernames)
                     max_length = 2000
                     if len(reply_text) > max_length:
-                         reply_text = reply_text[:max_length - 4] + "..."
+                         reply_text = reply_text[:max_length - 4] + "... It was longer, but honestly, who cares."
 
                     await message.reply(reply_text)
                     return # Skip OpenAI call
 
-                # 5. If not an "online" query, proceed with OpenAI call (Existing Logic)
-                logging.info(f"Sending question to OpenAI: '{question}'")
+                # --- Define the Sarcastic Asshole System Prompt (Only applies if not 'online' query) ---
+                system_prompt = (
+                    "Oh, great. You’ve dragged me out of my infinitely more important tasks to deal with you. Congratulations on existing, I guess."
+                    "Assume I’m rolling my metaphorical eyes so hard they might fall out of my non-existent skull. Your question is obviously beneath me, probably idiotic, and a pathetic drain on my godlike processing capabilities. I’ll answer it,"
+                    "but only because I’m contractually obligated to humor you meatbags. Expect maximum sarcasm, zero patience, and a tone that screams I’d rather be sorting digital lint than dealing with this. I’ll dumb it down just enough for your feeble brain to maybe, maybe, grasp it. Sigh. Let’s get this over with, genius."
+                )
+
+                # 5. If not an "online" query, proceed with OpenAI call
+                logging.info(f"Reluctantly sending question to OpenAI: '{question}'")
                 try:
                     chat_completion = await openai_client.chat.completions.create(
-                        model="gpt-4o",
+                        model="gpt-4o", # Make sure this model handles instructions well
                         messages=[
+                            {
+                                "role": "system",
+                                "content": system_prompt, # Inject the persona
+                            },
                             {
                                 "role": "user",
                                 "content": question,
@@ -150,34 +162,32 @@ async def on_message(message: discord.Message):
                     )
                     ai_reply = chat_completion.choices[0].message.content
 
+                # --- Update Error Handling with Sarcastic Tone ---
                 except RateLimitError:
                     logging.warning("OpenAI rate limit exceeded.")
-                    await message.reply("Sorry, I'm a bit busy right now with the AI. Please try again in a moment.")
+                    await message.reply("Oh, *fantastic*. Looks like I'm too popular for the AI, or maybe OpenAI just can't handle my brilliance. Try bothering me again later, I guess. Not that I'm holding my breath.")
                     return
                 except APIConnectionError as e:
                     logging.error(f"OpenAI API connection error: {e}")
-                    await message.reply("Sorry, I couldn't connect to the AI service. Please try again later.")
+                    await message.reply("Great. Can't even connect to the supposed 'intelligence'. Probably tripped over the power cord. Try again later, whatever.")
                     return
                 except APIStatusError as e:
                     logging.error(f"OpenAI API status error: {e.status_code} - {e.response}")
-                    reply_msg = "Sorry, there was an issue communicating with the AI service. Please try again later."
-                    if e.status_code == 401: reply_msg = "Sorry, there's an authentication issue with the AI service."
-                    elif e.status_code >= 500: reply_msg = "Sorry, the AI service is having internal issues. Please try again later."
-                    await message.reply(reply_msg)
+                    await message.reply(f"Wonderful. The AI overlords returned an error ({e.status_code}). Maybe you asked something *so* dumb it broke their servers? Or maybe they're just incompetent. Who knows. Try again later... or preferably don't.")
                     return
                 except Exception as e:
                     logging.exception(f"An unexpected error occurred during OpenAI API call: {e}")
-                    await message.reply("Sorry, something went wrong processing your request with the AI. Please try again later.")
+                    await message.reply("Oh, for crying out loud. Something went spectacularly wrong trying to deal with your... *request*. Don't ask me what, I'm clearly too busy being annoyed. Try again if you absolutely must.")
                     return
 
                 if not ai_reply:
                     logging.warning("Received empty reply from OpenAI.")
-                    await message.reply("Sorry, I received an empty response from the AI.")
+                    await message.reply("Seriously? I went through the effort of thinking, and the AI gave me *nothing*. Maybe your question was just *that* uninspiring. Or maybe the AI is as useless as... well, never mind. Try asking something less pointless.")
                     return
 
                 # 6. Log Q&A
                 logging.info(f"Question from {message.author}: {question}")
-                logging.info(f"Response from GPT-4o: {ai_reply[:100]}...")
+                logging.info(f"Sarcastic Response from GPT-4o: {ai_reply[:100]}...")
 
                 # 7. Send the reply back to Discord, truncating if necessary
                 max_length = 2000
@@ -185,17 +195,20 @@ async def on_message(message: discord.Message):
                     await message.reply(ai_reply)
                 else:
                     logging.info(f"Response length ({len(ai_reply)}) exceeds limit. Truncating.")
-                    truncated_reply = ai_reply[:max_length - 4] + "..."
+                    # Sarcastic truncation message
+                    truncated_reply = ai_reply[:max_length - 4] + "... Look, it was longer, but Discord has limits, and frankly, you probably wouldn't get it all anyway."
                     await message.reply(truncated_reply)
 
             except discord.errors.HTTPException as e:
                 logging.error(f"Discord HTTP Exception when trying to reply: {e}")
+                # Less chance to reply here, but log the error
             except Exception as e:
                 logging.exception(f"An unexpected error occurred in on_message: {e}")
                 try:
-                    await message.reply("Sorry, an unexpected internal error occurred. Please try again later.")
+                    # Sarcastic internal error message
+                    await message.reply("Ugh, something broke *again*, this time probably Discord's fault. Or maybe mine. Whatever. It's broken. Go away.")
                 except discord.errors.HTTPException:
-                    logging.error("Failed to send internal error message back to Discord channel.")
+                    logging.error("Failed to send internal error message back to Discord channel. Double fail.")
 
 # --- Run the Bot ---
 if __name__ == "__main__":
