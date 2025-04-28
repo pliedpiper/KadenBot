@@ -1,222 +1,227 @@
-import discord
 import os
 import logging
 import asyncio
-# Import the new client class and specific error types
-from openai import AsyncOpenAI, RateLimitError, APIConnectionError, APIStatusError
-# Keep the base openai import if needed for general APIError or other utilities
-import openai
-
+import discord
 from dotenv import load_dotenv
+from collections import defaultdict
 
-load_dotenv()  # Load environment variables from .env file
-# --- Configuration ---
-# Load environment variables
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # Still needed for the client init
+# New-style OpenAI SDK
+from openai import AsyncOpenAI, RateLimitError, APIConnectionError, APIStatusError
+import openai  # keep base import for potential utilities
 
-# Basic logging setup
+# ──────────────────────────  Configuration  ──────────────────────────
+load_dotenv()  # Load variables from .env
+DISCORD_TOKEN   = os.getenv("DISCORD_TOKEN")
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")   # still needed implicitly
+
+# --- Conversation Memory Configuration ---
+# Max number of messages (user + assistant combined) to keep in history per channel.
+# Set to 10 as requested. This means roughly 5 pairs of user/assistant messages.
+MAX_HISTORY_MESSAGES = 10
+# Optional: A system prompt to guide the AI's behavior
+SYSTEM_PROMPT = "You are a helpful assistant integrated into a Discord server."
+# --- End Memory Configuration ---
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-# Check for missing configuration
 if not DISCORD_TOKEN:
     logging.error("FATAL: DISCORD_TOKEN environment variable not set.")
-    exit()
+    raise SystemExit(1)
+
 if not OPENAI_API_KEY:
-    logging.warning("OPENAI_API_KEY environment variable not set. The OpenAI client will likely fail to authenticate.")
-    # Consider exiting if the key is strictly required for the bot to function
-    # exit()
+    logging.warning("OPENAI_API_KEY environment variable not set – "
+                    "the OpenAI client will fail once a request is made.")
 
-# --- OpenAI Client Setup (NEW WAY) ---
+# ──────────────────────────  OpenAI client  ──────────────────────────
 try:
-    # Instantiate the asynchronous client
-    openai_client = AsyncOpenAI()
-    logging.info("AsyncOpenAI client initialized successfully.")
+    openai_client = AsyncOpenAI()         # reads key from env
+    logging.info("AsyncOpenAI client initialised.")
 except Exception as e:
-    logging.error(f"Failed to initialize AsyncOpenAI client: {e}")
-    exit()
+    logging.exception("Failed to initialise AsyncOpenAI client: %s", e)
+    raise SystemExit(1)
 
-# --- Discord Bot Setup ---
-# Define necessary intents
+# ─────────────────── Conversation History Storage ────────────────────
+# Stores conversation history per channel { channel_id: [messages] }
+# Each message is a dict: {"role": "user" | "assistant", "content": "..."}
+conversation_histories = defaultdict(list)
+
+# ──────────────────────────  Discord client  ─────────────────────────
 intents = discord.Intents.default()
-intents.messages = True       # To receive messages
-intents.message_content = True # To read message content (Requires Privileged Intent)
-intents.guilds = True         # To identify the bot user and access guild information
-# *** SERVER MEMBERS INTENT IS REQUIRED FOR STATUS LOOKUP ***
-# *** Make sure this is enabled in the Discord Developer Portal too! ***
-intents.members = True
+intents.message_content = True  # privileged
+intents.guilds          = True
+intents.members         = True  # REQUIRED for member lists
+intents.presences       = True  # REQUIRED for .status (online / idle / dnd)
+intents.messages        = True  # (redundant but explicit)
 
-# Create the Discord client instance
 discord_client = discord.Client(intents=intents)
 
-# --- Helper Function for Online Members ---
-def get_online_members_list(guild: discord.Guild) -> list[str]:
-    """Gets a list of display names for online (online, idle, dnd) non-bot members."""
-    online_members = []
-    # Define statuses considered "online"
-    online_statuses = (discord.Status.online, discord.Status.idle, discord.Status.dnd)
+# ──────────────────────────  Helpers  ────────────────────────────────
+ONLINE_STATES = {
+    discord.Status.online,
+    discord.Status.idle,
+    discord.Status.dnd,
+}
 
-    if not guild: # Should not happen if called from on_message guild context, but safe check
-        return ["Could not retrieve members for this context."]
+async def get_online_usernames(guild: discord.Guild) -> list[str]:
+    """
+    Return a list of usernames with a presence of Online / Idle / DND.
+    Bots are excluded.
+    """
+    if guild is None:
+        return []
 
-    for member in guild.members:
-        # Check if member is not a bot and their status is one of the online ones
-        if not member.bot and member.status in online_statuses:
-            online_members.append(member.display_name) # Use display_name for nicknames
+    # Ensure the member cache is populated (for large guilds on first use)
+    await guild.chunk(cache=True)
 
-    return online_members
+    return [
+        member.display_name
+        for member in guild.members
+        if not member.bot and member.status in ONLINE_STATES
+    ]
 
-# --- Bot Event Handlers ---
+# ──────────────────────────  Events  ─────────────────────────────────
 @discord_client.event
-async def on_ready():
-    """Called when the bot successfully connects to Discord."""
-    logging.info(f'{discord_client.user.name} (ID: {discord_client.user.id}) is online.')
-    print(f'Logged in as {discord_client.user.name}')
-    print('------')
-    print("KadenBot is online. Ready to be bothered.") # Adjusted startup message
-    print('------')
+async def on_ready() -> None:
+    logging.info("%s (ID %s) is connected and ready.",
+                 discord_client.user, discord_client.user.id)
 
 @discord_client.event
-async def on_message(message: discord.Message):
-    """Called when a message is sent to any channel the bot can see."""
-    # 1. Ignore messages sent by the bot itself or messages not in a guild
-    if message.author == discord_client.user or not message.guild:
+async def on_message(message: discord.Message) -> None:
+    # Ignore the bot’s own messages
+    if message.author == discord_client.user:
         return
 
-    # 2. Check if the bot was mentioned
-    if discord_client.user and discord_client.user in message.mentions:
-        logging.info(f"Bot mentioned by {message.author} in server '{message.guild.name}' (Channel: #{message.channel})")
+    content_lower = message.content.lower()
+    channel_id = message.channel.id
 
-        # 3. Show typing indicator while processing
+    # ───── “who’s online” command (either !online or mention) ─────
+    is_prefix_cmd = content_lower.startswith("!online")
+    is_mention_cmd_online = (
+        discord_client.user in message.mentions and "who's online" in content_lower
+    )
+
+    if is_prefix_cmd or is_mention_cmd_online:
+        logging.info("Received online status request from %s in channel %s",
+                     message.author, channel_id)
+
         async with message.channel.typing():
-            try:
-                # 4. Extract the question (strip the mention)
-                mention_string = f'<@{discord_client.user.id}>'
-                mention_string_nick = f'<@!{discord_client.user.id}>'
+            users_online = await get_online_usernames(message.guild)
 
-                content = message.content
-                if content.startswith(mention_string):
-                    question = content[len(mention_string):].strip()
-                elif content.startswith(mention_string_nick):
-                    question = content[len(mention_string_nick):].strip()
-                else:
-                    question = content.replace(mention_string, '').replace(mention_string_nick, '').strip()
+        if users_online:
+            if len(users_online) == 1:
+                reply = f"{users_online[0]} is online right now."
+            else:
+                *first, last = users_online
+                reply = f"{', '.join(first)}, and {last} are online right now."
+        else:
+            reply = "Nobody (except me) is currently online or visible."
 
-                if not question:
-                    # Sarcastic reply for no question
-                    await message.reply("Wow, you managed to ping me without actually asking anything. Impressive levels of pointless. Try again, maybe with a *real* question this time? Or don't. See if I care.")
-                    logging.warning(f"Empty question from {message.author} after stripping mention.")
-                    return
+        try:
+            await message.reply(reply)
+        except discord.HTTPException as e:
+            logging.error("Discord error when replying with online list: %s", e)
+        return  # Do not continue to OpenAI logic
 
-                logging.info(f"Received potential query: '{question}'")
+    # ───── OpenAI chat: triggered when the bot is mentioned (and not asking who's online) ─────
+    if discord_client.user not in message.mentions:
+        return
 
-                # *** Check for "who's online" keywords FIRST ***
-                question_lower = question.lower()
-                online_keywords = ["who's online", "who is online", "online members", "members online", "list online"]
-                is_online_query = any(keyword in question_lower for keyword in online_keywords)
+    logging.info("Bot mentioned by %s in #%s (channel_id: %s)",
+                 message.author, message.channel, channel_id)
 
-                if is_online_query:
-                    logging.info(f"Handling 'who's online' request from {message.author}. How tedious.")
-                    online_users = get_online_members_list(message.guild)
+    async with message.channel.typing():
+        try:
+            mention_plain  = f"<@{discord_client.user.id}>"
+            mention_nick   = f"<@!{discord_client.user.id}>"
+            question = message.content.replace(mention_plain, "").replace(
+                mention_nick, ""
+            ).strip()
 
-                    if not online_users:
-                        reply_text = "Ugh, looks like everyone has better things to do than be online right now. Shocking. Or maybe I just can't be bothered to see them properly."
-                    else:
-                        count = len(online_users)
-                        reply_text = f"Fine. Since you asked *so nicely* (you didn't), here are the {count} apparent lifeforms currently online:\n- " + "\n- ".join(online_users)
-                        reply_text += "\nNow leave me alone."
+            if not question:
+                await message.reply("You mentioned me but asked nothing!")
+                return
 
-                    # Truncate if somehow the list is massive (unlikely for usernames)
-                    max_length = 2000
-                    if len(reply_text) > max_length:
-                         reply_text = reply_text[:max_length - 4] + "... It was longer, but honestly, who cares."
+            # --- Prepare message history for OpenAI ---
+            # Start with the system prompt
+            messages_for_api = []
+            if SYSTEM_PROMPT:
+                 messages_for_api.append({"role": "system", "content": SYSTEM_PROMPT})
 
-                    await message.reply(reply_text)
-                    return # Skip OpenAI call
+            # Add existing history for this channel (up to the limit)
+            # Keep MAX_HISTORY_MESSAGES - 1 to leave space for the current user message
+            history = conversation_histories[channel_id]
+            # Calculate how many messages to actually take from history
+            # Ensure we don't try to take more than available or more than the limit allows
+            history_limit_for_api = max(0, MAX_HISTORY_MESSAGES - 1) # Max history items to send
+            actual_history_to_send = history[-history_limit_for_api:] # Get the slice
 
-                # --- Define the Sarcastic Asshole System Prompt (Only applies if not 'online' query) ---
-                system_prompt = (
-                    "Oh, great. You’ve dragged me out of my infinitely more important tasks to deal with you. Congratulations on existing, I guess."
-                    "Assume I’m rolling my metaphorical eyes so hard they might fall out of my non-existent skull. Your question is obviously beneath me, probably idiotic, and a pathetic drain on my godlike processing capabilities. I’ll answer it,"
-                    "but only because I’m contractually obligated to humor you meatbags. Expect maximum sarcasm, zero patience, and a tone that screams I’d rather be sorting digital lint than dealing with this. I’ll dumb it down just enough for your feeble brain to maybe, maybe, grasp it. Sigh. Let’s get this over with, genius."
-                )
+            messages_for_api.extend(actual_history_to_send)
 
-                # 5. If not an "online" query, proceed with OpenAI call
-                logging.info(f"Reluctantly sending question to OpenAI: '{question}'")
-                try:
-                    chat_completion = await openai_client.chat.completions.create(
-                        model="gpt-4o", # Make sure this model handles instructions well
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": system_prompt, # Inject the persona
-                            },
-                            {
-                                "role": "user",
-                                "content": question,
-                            }
-                        ],
-                    )
-                    ai_reply = chat_completion.choices[0].message.content
+            # Add the new user question
+            user_message = {"role": "user", "content": question}
+            messages_for_api.append(user_message)
+            # --- End History Preparation ---
 
-                # --- Update Error Handling with Sarcastic Tone ---
-                except RateLimitError:
-                    logging.warning("OpenAI rate limit exceeded.")
-                    await message.reply("Oh, *fantastic*. Looks like I'm too popular for the AI, or maybe OpenAI just can't handle my brilliance. Try bothering me again later, I guess. Not that I'm holding my breath.")
-                    return
-                except APIConnectionError as e:
-                    logging.error(f"OpenAI API connection error: {e}")
-                    await message.reply("Great. Can't even connect to the supposed 'intelligence'. Probably tripped over the power cord. Try again later, whatever.")
-                    return
-                except APIStatusError as e:
-                    logging.error(f"OpenAI API status error: {e.status_code} - {e.response}")
-                    await message.reply(f"Wonderful. The AI overlords returned an error ({e.status_code}). Maybe you asked something *so* dumb it broke their servers? Or maybe they're just incompetent. Who knows. Try again later... or preferably don't.")
-                    return
-                except Exception as e:
-                    logging.exception(f"An unexpected error occurred during OpenAI API call: {e}")
-                    await message.reply("Oh, for crying out loud. Something went spectacularly wrong trying to deal with your... *request*. Don't ask me what, I'm clearly too busy being annoyed. Try again if you absolutely must.")
-                    return
+            logging.info("Forwarding query to OpenAI (history length %d): %s",
+                         len(actual_history_to_send), # Log actual history length sent
+                         question)
 
-                if not ai_reply:
-                    logging.warning("Received empty reply from OpenAI.")
-                    await message.reply("Seriously? I went through the effort of thinking, and the AI gave me *nothing*. Maybe your question was just *that* uninspiring. Or maybe the AI is as useless as... well, never mind. Try asking something less pointless.")
-                    return
+            chat_completion = await openai_client.chat.completions.create(
+                model="gpt-4o-mini",   # adjust to an available model name
+                messages=messages_for_api, # Send history + new question
+            )
+            # Ensure we handle potential empty responses gracefully
+            ai_reply = chat_completion.choices[0].message.content if chat_completion.choices else "Sorry, I couldn't generate a response."
+            ai_message = {"role": "assistant", "content": ai_reply}
 
-                # 6. Log Q&A
-                logging.info(f"Question from {message.author}: {question}")
-                logging.info(f"Sarcastic Response from GPT-4o: {ai_reply[:100]}...")
+            # --- Update conversation history ---
+            # Add the user's actual question
+            conversation_histories[channel_id].append(user_message)
+            # Add the AI's response
+            conversation_histories[channel_id].append(ai_message)
+            # Prune history to max length (ensures storage doesn't exceed MAX_HISTORY_MESSAGES)
+            conversation_histories[channel_id] = conversation_histories[channel_id][-MAX_HISTORY_MESSAGES:]
+            logging.info("Updated history for channel %s, new stored length: %d",
+                         channel_id, len(conversation_histories[channel_id]))
+            # --- End History Update ---
 
-                # 7. Send the reply back to Discord, truncating if necessary
-                max_length = 2000
-                if len(ai_reply) <= max_length:
-                    await message.reply(ai_reply)
-                else:
-                    logging.info(f"Response length ({len(ai_reply)}) exceeds limit. Truncating.")
-                    # Sarcastic truncation message
-                    truncated_reply = ai_reply[:max_length - 4] + "... Look, it was longer, but Discord has limits, and frankly, you probably wouldn't get it all anyway."
-                    await message.reply(truncated_reply)
+        except RateLimitError:
+            logging.warning("OpenAI Rate Limit encountered in channel %s", channel_id)
+            await message.reply("OpenAI is rate-limited right now – please wait a bit.")
+            return
+        except APIConnectionError as e:
+            logging.error("OpenAI connection issue: %s", e)
+            await message.reply("Couldn’t reach OpenAI right now – try again later.")
+            return
+        except APIStatusError as e:
+            logging.error("OpenAI API status error: %s %s", e.status_code, e)
+            await message.reply("OpenAI returned an error. Try again later.")
+            return
+        except Exception as e:
+            logging.exception("Unexpected error during OpenAI interaction: %s", e)
+            await message.reply("An unexpected error occurred – sorry!")
+            return
 
-            except discord.errors.HTTPException as e:
-                logging.error(f"Discord HTTP Exception when trying to reply: {e}")
-                # Less chance to reply here, but log the error
-            except Exception as e:
-                logging.exception(f"An unexpected error occurred in on_message: {e}")
-                try:
-                    # Sarcastic internal error message
-                    await message.reply("Ugh, something broke *again*, this time probably Discord's fault. Or maybe mine. Whatever. It's broken. Go away.")
-                except discord.errors.HTTPException:
-                    logging.error("Failed to send internal error message back to Discord channel. Double fail.")
+        # Discord hard limit 2000 chars
+        try:
+            if len(ai_reply) <= 2000:
+                await message.reply(ai_reply)
+            else:
+                # Send truncated message if too long
+                await message.reply(ai_reply[:1996] + " ...")
+                logging.warning("AI response truncated for channel %s due to >2000 char limit.", channel_id)
+        except discord.HTTPException as e:
+            logging.error("Discord error when sending AI reply: %s", e)
 
-# --- Run the Bot ---
+
+# ──────────────────────────  Main  ───────────────────────────────────
 if __name__ == "__main__":
     try:
         discord_client.run(DISCORD_TOKEN, log_handler=None)
     except discord.LoginFailure:
-        logging.error("FATAL: Improper Discord token passed.")
-    except discord.PrivilegedIntentsRequired:
-        logging.error("FATAL: The Server Members Intent is required but not enabled in the Developer Portal or is missing from the code's intents.")
-    except Exception as e:
-        logging.exception(f"FATAL: An error occurred during bot startup or runtime: {e}")
+        logging.error("FATAL: bad Discord token.")
+    except Exception:
+        logging.exception("FATAL: error during bot runtime.")
