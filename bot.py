@@ -170,7 +170,7 @@ async def on_message(message: discord.Message) -> None:
                          question)
 
             chat_completion = await openai_client.chat.completions.create(
-                model="gpt-4o-mini",   # adjust to an available model name
+                model="gpt-4.1",   # adjust to an available model name
                 messages=messages_for_api, # Send history + new question
             )
             # Ensure we handle potential empty responses gracefully
